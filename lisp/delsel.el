@@ -68,16 +68,13 @@ Value must be the register (key) to use."
           (character :tag "Register (Key)"))
   :group 'editing-basics)
 
+;; FIXME: Why not just define a face?
 (defcustom delete-selection-replacement-face 'highlight
   "If non-nil, active region replacement text is shown in this face.
 The highlighted text is the text that will be inserted by
 the `delete-selection-repeat-replace-region' command."
   :type 'face
-  :group 'editing-basics
-  :set (lambda (symbol value)
-         (set-default symbol value)
-         (if delsel--replace-overlay
-             (overlay-put delsel--replace-overlay 'face value))))
+  :group 'editing-basics)
 
 (defcustom delete-selection-temporary-region nil
   "Whether to delete only temporary regions.
@@ -128,8 +125,8 @@ For compatibility with features and packages that are aware of
     (setq-default delete-selection-mode nil) ; But keep it globally disabled.
     )))
 
-(defvar delsel--replace-overlay nil)    ;overlay
-(defvar delsel--replace-text nil)    ;text from overlay
+(defvar delsel--replace-text-or-position nil
+  "Can be a string or an overlay.")
 
 ;;;###autoload
 (defun delete-active-region (&optional killp)
@@ -145,16 +142,42 @@ the active region is killed instead of deleted."
    (delete-selection-save-to-register
     (set-register delete-selection-save-to-register
                   (funcall region-extract-function t))
-    (if delsel--replace-overlay
-        (move-overlay delsel--replace-overlay (point) (point) (current-buffer))
-      (setq delsel--replace-overlay
-            (make-overlay (point) (point) (current-buffer) nil t))
+    ;; FIXME: This overlay stays "alive" too long (i.e. well after
+    ;; the users are likely to consider they've completed the replacement).
+    ;; Maybe we should setup `cusror-sensor-mode' to call
+    ;; `delete--replacement-string'. when the cursor moves away from
+    ;; the overlay.
+    (if (overlayp delsel--replace-text-or-position)
+        (move-overlay delsel--replace-text-or-position
+                      (point) (point) (current-buffer))
+      (setq delsel--replace-text-or-position
+            (make-overlay (point) (point) nil nil t))
       (if delete-selection-replacement-face
-          (overlay-put delsel--replace-overlay 'face
-                       delete-selection-replacement-face)))
-    (setq delsel--replace-text nil))
+          (overlay-put delsel--replace-text-or-position 'face
+                       delete-selection-replacement-face))))
    (t
     (funcall region-extract-function 'delete-only))))
+
+(defun delete--replacement-string ()
+  ;; If this is the first use after overwriting regions,
+  ;; find the replacement text by looking at the overlay.
+  (when (overlayp delsel--replace-text-or-position)
+    (if (null (overlay-buffer delsel--replace-text-or-position))
+        (setq delsel--replace-text-or-position nil)
+      (with-current-buffer (overlay-buffer delsel--replace-text-or-position)
+        (let ((s (overlay-start delsel--replace-text-or-position))
+              (e (overlay-end delsel--replace-text-or-position)))
+          (delete-overlay delsel--replace-text-or-position)
+          (if (= s e)
+              (setq delsel--replace-text-or-position nil)
+            (setq delsel--replace-text-or-position
+                  (filter-buffer-substring s e))
+            (set-text-properties
+             0 (length delsel--replace-text-or-position)
+             nil delsel--replace-text-or-position))))))
+  (cl-assert (or (null delsel--replace-text-or-position)
+                 (stringp delsel--replace-text-or-position)))
+  delsel--replace-text-or-position)
 
 (defun delete-selection-repeat-replace-region (arg)
   "Repeat replacing text of highlighted region with typed text.
@@ -169,28 +192,14 @@ Just `\\[universal-argument]' means repeat until the end of the buffer's accessi
                  (prefix-numeric-value current-prefix-arg))))
     (if (not (and old-text (> (length old-text) 0)))
         (message "No known previous replacement")
-      ;; If this is the first use after overwriting regions,
-      ;; find the replacement text by looking at the undo list.
-      (when (and (null delsel--replace-text)
-                 delsel--replace-overlay
-                 (buffer-live-p (overlay-buffer delsel--replace-overlay)))
-        (with-current-buffer (overlay-buffer delsel--replace-overlay)
-          (let ((s (overlay-start delsel--replace-overlay))
-                (e (overlay-end delsel--replace-overlay)))
-            (when (/= s e)
-              (setq delsel--replace-text
-                    (filter-buffer-substring s e))
-              (set-text-properties
-               0 (length delsel--replace-text)
-               nil delsel--replace-text))))
-        (delete-overlay delsel--replace-overlay))
-      (if delsel--replace-text
-          (while (and (> count 0)
-                      delsel--replace-text
-                      (search-forward old-text nil t))
-            (replace-match delsel--replace-text nil t)
-            (setq count (1- count)))
-        (message "Cannot locate replacement text")))))
+      (let ((string (delete--replacement-string)))
+        (if string
+            (while (and (> count 0)
+                        string
+                        (search-forward old-text nil t))
+              (replace-match string nil t)
+              (setq count (1- count)))
+          (message "Cannot locate replacement text"))))))
 
 (defun delete-selection-helper (type)
   "Delete selection according to TYPE:
